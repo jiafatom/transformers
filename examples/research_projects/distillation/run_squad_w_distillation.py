@@ -106,6 +106,8 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
     else:
         t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
 
+    t_total = 3
+
     # Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ["bias", "LayerNorm.weight"]
     optimizer_grouped_parameters = [
@@ -186,10 +188,20 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
     )
     # Added here for reproductibility
     set_seed(args)
+    total_count = 0
 
     for _ in train_iterator:
+        if total_count > 0:
+            break
+        total_count += 1
+        print("total_count = " + str(total_count))
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+        step_count = 0
         for step, batch in enumerate(epoch_iterator):
+            if step_count > 0:
+                break
+            step_count += 1
+            print("step_count = " + str(step_count))
 
             # Skip past any already trained steps if resuming training
             if steps_trained_in_current_epoch > 0:
@@ -214,7 +226,10 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
                 if args.version_2_with_negative:
                     inputs.update({"is_impossible": batch[7]})
             outputs = model(**inputs)
-            loss, start_logits_stu, end_logits_stu = outputs
+            # loss, start_logits_stu, end_logits_stu = outputs
+            loss = outputs.loss
+            start_logits_stu = outputs.start_logits
+            end_logits_stu = outputs.end_logits
 
             # Distillation loss
             if teacher is not None:
@@ -303,6 +318,43 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
                 break
+
+            with torch.no_grad():
+                # NOTE: determine input name order
+                input_names = ['input_ids', 'attention_mask', 'start_positions', 'end_positions']
+                onnx_model_path = 'models/model.onnx'
+                import io
+                f = io.BytesIO()
+                model.eval()
+                # model.train()
+                torch.onnx.export(model,
+                                (inputs,),
+                                onnx_model_path,
+                                opset_version=12,
+                                do_constant_folding=False,
+                                input_names=input_names,
+                                training=torch.onnx.TrainingMode.EVAL,
+                                # training=torch.onnx.TrainingMode.TRAINING,
+                                use_external_data_format=False)
+                print("export successfully")                
+                import onnxruntime
+                ort_sess = onnxruntime.InferenceSession(onnx_model_path)
+                ort_inputs = {k:inputs[k].detach().cpu().numpy() for k in input_names}
+                ort_outputs = ort_sess.run(None, ort_inputs)
+
+                outputs = model(**inputs)
+
+                import numpy as np
+                print('Compare results between PT and ORT')
+                outputs_flatten = []
+                outputs_flatten.append(outputs['loss'])
+                outputs_flatten.append(outputs['start_logits'])
+                outputs_flatten.append(outputs['end_logits'])
+
+                for idx in range(2):
+                    np.testing.assert_allclose(outputs_flatten[idx], ort_outputs[idx], atol=1e-3, rtol=2e-3)
+
+                print('Number matches between PT and ORT')
         if args.max_steps > 0 and global_step > args.max_steps:
             train_iterator.close()
             break
@@ -840,6 +892,7 @@ def main():
 
     # Evaluation - we can ask to evaluate all the checkpoints (sub-directories) in a directory
     results = {}
+    return results
     if args.do_eval and args.local_rank in [-1, 0]:
         if args.do_train:
             logger.info("Loading checkpoints saved during training for evaluation")
